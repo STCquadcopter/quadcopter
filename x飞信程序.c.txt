@@ -1,0 +1,367 @@
+//=========================================================================
+//                                 MCU工作频率:27MHz
+//=========================================================================
+
+#include <STC15F2K60S2.h>	//STC15系列通用头文件
+#include <intrins.h>		//STC特殊命令符号声明
+#include <MPU6050.H>		//MPU6050数字陀螺仪
+#include <STC15W4KPWM.H>	//单片机所有IO口初始化-PWM口初始化
+//#include <EEPROM.h>		//STC-EEPROM内部存储
+#include <NRF24L01.h>	    //NRF24L01 2.4G无线收发模块
+//#include <STC15W4K-ADC.h>	//STC15W4K-ADC	硬件ADC模数转换
+#include <IMU.H>			//IMU飞行核心算法
+//==================================================//
+//  外围引脚定义
+//==================================================//
+sbit LEDH3=P5^4; //四轴航向灯 1=灭 0=亮
+sbit LEDH4=P1^0; //四轴航向灯 1=灭 0=亮
+sbit LEDH1=P3^2; //四轴航向灯 1=灭 0=亮
+sbit LEDH2=P3^3; //四轴航向灯 1=灭 0=亮
+
+
+
+unsigned int LED_mun=0;
+//==================================================//
+//  飞行控制变量
+//==================================================//
+unsigned char JieSuo;	//断开/连接 解锁变量
+unsigned int YouMen;	//油门变量
+unsigned int HangXiang;	//航向变量
+unsigned int HengGun;	//横滚变量
+unsigned int FuYang;	//俯仰变量
+unsigned char  FYHG;	//俯仰横滚变量
+unsigned char  GaoDu;	//高度变量
+unsigned char  DianYa;	//电压变量
+unsigned int ADC1,ADC2; //adc模数转换 10位 结果变量
+unsigned char SSLL,lastR0,ZT;     //通讯状态 变量
+//==================================================//
+//                  全局函数定义
+//==================================================//
+unsigned char TxBuf[12]; //设置发送长度，最高为32字节	 
+unsigned char RxBuf[12]; //设置接收长度，最高为32字节
+//==================================================//
+//  PID算法变量
+//==================================================//
+//连至上位机检查电机轴是否发生弯曲，发现问题电机及时更换
+unsigned int YM=0;						//油门变化速度控制，
+int speed0=0,speed1=0,speed2=0,speed3=0;//电机速度参数
+int PWM0=0,PWM1=0,PWM2=0,PWM3=0;		//加载至PWM模块的参数
+int g_x=0,g_y=0,g_z=0;          		//陀螺仪矫正参数
+char a_x=0,a_y=0,a_z=0;					//角度矫正参数
+//*****************角度参数*************************************************
+float Last_Angle_gx=0;					  //外环PI输出量  上一次陀螺仪数据
+float Last_Angle_gy=0;						  //外环PI输出量  上一次陀螺仪数据
+double Gyro_y=0,Gyro_x=0,Gyro_z=0;        //Y轴陀螺仪数据暂存
+double Accel_x=0,Accel_y=0,Accel_z=0;	  //X轴加速度值暂存
+double Angle_ax=0,Angle_ay=0,Angle_az=0;  //由加速度计算的加速度(弧度制)
+double Angle_gy=0,Angle_gx=0,Angle_gz=0;  //由角速度计算的角速率(角度制)
+double Anglezlate=0;                      //Z轴相关
+int data AngleX=0,AngleY=0;				  //四元数解算出的欧拉角
+double Ax=0,Ay=0;Az=0;                    //加入遥控器控制量后的角度
+//****************姿态处理和PID*********************************************
+float FR1=0,FR2=0,FR3=0;	    //方向控制数据变量
+float xdata gx=0,gy=0;				//加入遥控器控制量后的角度
+
+float  data PID_Output;				//PID最终输出量
+
+float xdata ERRORX_In=0;			//内环P 内环I 内环D 内环误差积分
+float xdata ERRORX_Out=0;			//外环P 外环I       外环误差积分
+
+float xdata ERRORY_In=0;
+float xdata ERRORY_Out=0;
+
+float xdata ERRORZ_Out=0;
+
+float xdata Last_Ax=0;
+float xdata Last_Ay=0;
+
+float xdata Last_gx=0;
+float xdata Last_gy=0;
+
+
+//==================================================//
+//   PID 手动微调参数值
+//==================================================//
+// D值只要不超过10都可以，D值在3以上10以下!!! D值不合适飞机就会荡
+#define	Out_XP	15.0f	//外环P
+#define	Out_XI	0.01f	//外环I
+#define	Out_XD	5.0f	//外环D
+
+#define	In_XP	0.55f	//内环P 720
+#define	In_XI	0.01f	//内环I
+#define	In_XD	3.0f	//内环D 720
+
+#define	In_YP	In_XP
+#define	In_YI	In_XI
+#define	In_YD	In_XD
+
+#define	Out_YP	Out_XP
+#define	Out_YI	Out_XI
+#define	Out_YD	Out_XD
+
+//float ZP=5.0,ZD=4.0;	//自旋控制的P D
+#define	ZP	3.0f
+#define	ZD	1.0f	 //自旋控制的P D
+
+#define	ERR_MAX	800	 //
+
+//--------------------------------------------------//
+//  PID算法飞控自平衡 函数
+//--------------------------------------------------//
+void Flight(void)interrupt 1 
+{	
+	//陀螺仪水平校准-后期更新
+//	Gyro_x = GetData(GYRO_XOUT_H)-g_x;//陀螺仪 值
+//	Gyro_y = GetData(GYRO_YOUT_H)-g_y;//减掉 校正值
+//	Gyro_z = GetData(GYRO_ZOUT_H)-g_z;	
+//  读取MCU6050 寄存器数据
+	Gyro_x = GetData(GYRO_XOUT_H);//读出 X轴陀螺仪数据
+	Gyro_y = GetData(GYRO_YOUT_H);//读出 Y轴陀螺仪数据
+	Gyro_z = GetData(GYRO_ZOUT_H);//读出 Z轴陀螺仪数据	
+	Accel_y= GetData(ACCEL_YOUT_H);//读出 X轴加速度数据
+	Accel_x= GetData(ACCEL_XOUT_H);//读出 Y轴陀螺仪数据		   
+	Accel_z= GetData(ACCEL_ZOUT_H);//读出 Z轴加速度数据	     
+	//姿态数据算法 （借鉴STC官方算法）
+	Last_Angle_gx=Angle_gx;   //储存上一次角速度数据
+	Last_Angle_gy=Angle_gy;	  //储存上一次角速度数据
+	Angle_ax=(Accel_x)/8192;  //加速度处理
+	Angle_az=(Accel_z)/8192;  //加速度量程 +-4g/S
+	Angle_ay=(Accel_y)/8192;  //转换关系   8192LSB/g
+	Angle_gx=(Gyro_x)/65.5;   //陀螺仪处理
+	Angle_gy=(Gyro_y)/65.5;   //陀螺仪量程 +-500度/S
+	Angle_gz=(Gyro_z)/65.5;   //转换关系65.5LSB/度
+//***********************************四元数解算***********************************
+	IMUupdate(Angle_gx*0.0174533,Angle_gy*0.0174533,Angle_gz*0.0174533,Angle_ax,Angle_ay,Angle_az);//0.174533为PI/180 目的是将角度转弧度
+//****以下是飞行控制算法***********************************************************************
+	YM=YouMen;	 //输入油门量0-1000
+
+	if(SSLL == lastR0)	//如果RxBuf[0]的数据没有收到 即失联
+	{
+		if(++ZT >= 100)
+		{
+			ZT = 101;	//状态标识大于128即1秒没有收到数据，失控保护
+			
+			RxBuf[4] = 128;
+			
+			RxBuf[5] = 128; //触发失控保护 ，缓慢下降，俯仰横滚方向舵归中
+			
+			RxBuf[6] = 128;
+			
+			if(YouMen != 0)	   //油门
+			{
+				YouMen--;	//油门在原值逐渐减小
+				YM=YouMen;
+				TxBuf[2]=YM/0xff;//发送 油门参数 高2位 
+				TxBuf[3]=YM%0xff;//发送 油门参数 低8位
+			}
+		}
+	}
+	else{	ZT = 0;			}
+	lastR0 = SSLL;
+//****以下是飞行控制算法***********************************************************************
+
+//************** MPU6050 X轴指向 ***********************************************************
+//	FR1=0;//关闭横滚
+	FR1=((float)HengGun-128)/6; //得到 横滚数据变量
+	Ax=-FR1+a_x-AngleX;   //角度控制量加载至角度
+
+
+	if(YM > 30)	ERRORX_Out += Ax;	//外环积分(油门小于某个值时不积分)
+	else		ERRORX_Out = 0;		//油门小于定值时清除积分值
+
+		 if(ERRORX_Out >  ERR_MAX)	ERRORX_Out =  ERR_MAX;	//积分限幅
+	else if(ERRORX_Out < -ERR_MAX)	ERRORX_Out = -ERR_MAX;	//积分限幅
+	
+	PID_Output = Ax*Out_XP + ERRORX_Out*Out_XI+(Ax-Last_Ax)*Out_XD;	//外环PID
+	Last_Ax=Ax;
+//	if(YM > 20)	ERRORX_In += (Angle_gy - PID_Output);	//内环积分(油门小于某个值时不积分)
+	gy=PID_Output - Angle_gy;
+
+
+	if(YM > 30)	ERRORX_In += gy;	//内环积分(油门小于某个值时不积分)
+	else		ERRORX_In  = 0; //油门小于定值时清除积分值
+
+		 if(ERRORX_In >  ERR_MAX)	ERRORX_In =  ERR_MAX;
+	else if(ERRORX_In < -ERR_MAX)	ERRORX_In = -ERR_MAX; //积分限幅
+	
+//	PID_Output = (Angle_gy + PID_Output)*In_XP + ERRORX_In*In_XI + (Angle_gy - Last_Angle_gy)*In_XD;	//内环PID
+	PID_Output = gy*In_XP + ERRORX_In*In_XI + (gy-Last_gy)*In_XD;
+	Last_gy=gy;
+	if(PID_Output >  1000)	PID_Output =  1000;  //输出量限幅
+	if(PID_Output < -1000)	PID_Output = -1000;
+	
+	speed0 = 0 + PID_Output;	speed1 = 0 - PID_Output;
+	speed3 = 0 + PID_Output;	speed2 = 0 - PID_Output;
+//**************MPU6050 Y轴指向**************************************************
+	FR2=((float)FuYang-128)/6; //得到 俯仰数据变量
+	Ay=-FR2-a_y-AngleY;      //角度控制量加载至角度
+
+	if(YM > 30)		ERRORY_Out += Ay;				//外环积分(油门小于某个值时不积分)
+	else			ERRORY_Out = 0;					//油门小于定值时清除积分值
+	if(ERRORY_Out >  ERR_MAX)	ERRORY_Out =  ERR_MAX;
+	else if(ERRORY_Out < -ERR_MAX)	ERRORY_Out = -ERR_MAX;			//积分限幅
+	
+	PID_Output = Ay*Out_YP + ERRORY_Out*Out_YI+(Ay-Last_Ay)*Out_YD;	//外环PID
+	Last_Ay=Ay;
+	gx=PID_Output - Angle_gx;
+	if(YM > 30)ERRORY_In +=gx;								//内环积分(油门小于某个值时不积分)
+	else			ERRORY_In = 0;							//油门小于定值时清除积分值
+		 if(ERRORY_In >  ERR_MAX)	ERRORY_In =  ERR_MAX;
+	else if(ERRORY_In < -ERR_MAX)	ERRORY_In = -ERR_MAX;	//积分限幅
+	
+//	PID_Output = (Angle_gx + PID_Output)*In_YP + ERRORY_In*In_YI + (Angle_gx - Last_Angle_gx)*In_YD;	//内环PID
+	PID_Output = gx*In_YP + ERRORY_In*In_YI + (gx - Last_gx)*In_YD;
+	Last_gx=gx;
+	if(PID_Output >  1000)	PID_Output =  1000;  //输出量限幅
+	if(PID_Output < -1000)	PID_Output = -1000;
+	
+	speed0 = speed0 + PID_Output;	speed1 = speed1 + PID_Output;//加载到速度参数
+	speed3 = speed3 - PID_Output;	speed2 = speed2 - PID_Output;
+
+//************** MPU6050 Z轴指向 *****************************	
+	FR3=((float)HangXiang-128)*1.5;//得到 航向数据变量
+	Az=FR3+a_z-Angle_gz;
+	if(YM > 30)		ERRORZ_Out += Az;
+	else			ERRORZ_Out  = 0; 
+	if(ERRORZ_Out >  800)	ERRORZ_Out =  800;
+	else if(ERRORZ_Out < -800)	ERRORZ_Out = -800;	//积分限幅
+	PID_Output = Az*ZP + ERRORZ_Out * 0.2f + (Az - Anglezlate) * ZD;
+
+	Anglezlate = Az;
+	speed0 = speed0 + PID_Output;	speed1 = speed1 - PID_Output;
+	speed3 = speed3 - PID_Output;	speed2 = speed2 + PID_Output;
+
+//*****************PID控制数值--X机型控制***************************************************
+//**************将速度参数加载至PWM模块*************************************************	
+	//速度参数控制，防止超过PWM参数范围0-1000（X型有效）
+	PWM0=(YM+speed1);if(PWM0>1000)PWM0=1000;else if(PWM0<0)PWM0=0;		// 5
+	PWM1=(YM+speed2);if(PWM1>1000)PWM1=1000;else if(PWM1<0)PWM1=0;		// 3
+	PWM2=(YM+speed0);if(PWM2>1000)PWM2=1000;else if(PWM2<0)PWM2=0;		// 4
+	PWM3=(YM+speed3);if(PWM3>1000)PWM3=1000;else if(PWM3<0)PWM3=0;		// 2
+  	
+	//满足条件：（解锁=1；2.4G=5；油门大于30）才能控制电机
+	if(JieSuo==1&&YM>=30)
+	  {PWM(1000-PWM0,1000-PWM1,1000-PWM2,1000-PWM3);} //启动PWM		  2 3 4 5
+	else	  
+	  {PWM(1000,1000,1000,1000);}                     //关闭PWM
+} 
+//--------------------------------------------------//
+//  时间延时 函数
+//--------------------------------------------------//
+void Delay(unsigned int x)
+{unsigned int i,j;
+  for(i=0;i<x;i++)
+  for(j=0;j<250;j++);
+}
+//--------------------------------------------------//
+//  定时器0 初始化函数 V2.0
+//--------------------------------------------------//
+void Timer0Init(void)	//10微秒@27.000MHz
+{
+	TR0 = 0;
+	AUXR &= 0x7F;	//定时器时钟12T模式
+	TMOD &= 0xF0;	//设置定时器模式
+	IE  = 0x82;
+	TL0 = 0x1C;		//设置定时初值
+	TH0 = 0xA8;		//设置定时初值
+	TF0 = 0;		//清除TF0标志
+	TR0 = 1;		//定时器0开始计时
+
+}
+	
+//--------------------------------------------------//
+//  程序 主函数
+//--------------------------------------------------//
+void main(void)
+{
+
+//	unsigned char DCDY;//电池电压 变量
+	unsigned char SHU_mun;
+	/*----华丽的分割线----华丽的分割线----华丽的分割线----华丽的分割线----*/
+	PWMGO();		//初始化PWM
+	Delay(10);    // 延时 100
+//	InitADC();		//ADC模数转换 初始化
+	Delay(10);    // 延时 100
+	InitMPU6050();	//初始化MPU-6050
+	Delay(10);    // 延时 100
+	init_NRF24L01() ;  //NRF24L01 初始化
+	nRF24L01_RX_Mode(RxBuf);//数据接收
+	Delay(10);    // 延时 100
+	Timer0Init();	//初始化定时器
+	/*----华丽的分割线----华丽的分割线---  ---*/
+	Delay(100);	//延时一会 1S
+	YouMen =0;		//初始化油门变量 
+	HangXiang=128;	//初始化航向变量 
+	HengGun =128;	//初始化横滚变量 
+	FuYang  =128;	//初始化俯仰变量
+	/*----华丽的分割线----华丽的分割线----*/
+
+    EA = 1;  //开总中断
+	PWM(1000,1000,1000,1000);
+	while(1)
+	{				
+		nRF24L01_TX_Mode(TxBuf);//数据发送
+		Delay(1);
+		nRF24L01_RX_Mode(RxBuf);//数据接收
+		Delay(1);
+	
+		SSLL     =RxBuf[0];	 //接收 失联变量
+
+
+		JieSuo   =RxBuf[1];	 //接收 命令值
+
+		if(SSLL != lastR0)	//如果RxBuf[0]的数据没有收到 即失联
+			YouMen	 =RxBuf[2]*0xff+RxBuf[3];  //接收 油门变量
+
+		HangXiang=RxBuf[4];	 //接收 航向变量 
+		HengGun  =RxBuf[5];	 //接收 横滚变量 
+		FuYang   =RxBuf[6];	 //接收 俯仰变量
+	//	XXGG	 =RxBuf[7];  //接收 设置参数变量
+		a_x		 =RxBuf[8]-128;	 //接收
+		a_y	     =RxBuf[9]-128;	 //接收
+		a_z 	 =RxBuf[10]-128;	 //接收
+	
+	/*----华丽的分割线---*/			 	
+		LED_mun++;
+		
+		if(JieSuo==1)				 //解锁飞机	  SHU_mun
+		{	
+			if(LED_mun>600) LED_mun=0;		
+			if(LED_mun>150)
+			{
+				LEDH1=0;LEDH2=0;LEDH3=0;LEDH4=0;  //点亮航向灯
+			}
+			else
+			{
+				LEDH1=1;LEDH2=1;LEDH3=1;LEDH4=1;  //关航向灯
+			}
+			if(SHU_mun==1)
+			{
+			   PWM(600,600,600,600);
+			   Delay(1000);    // 延时 
+			   SHU_mun=0;
+			}
+		}
+		else					   //锁上飞机
+		{
+			
+			if(LED_mun<50)
+			{
+				SHU_mun=1;
+				LEDH1=1;LEDH2=1;LEDH3=0;LEDH4=1;  //点亮1航向灯
+			}
+			else if(LED_mun<100)
+			{
+				LEDH1=1;LEDH2=1;LEDH3=1;LEDH4=0;  //点亮2航向灯
+			}
+			else if(LED_mun<150)
+			{
+				LEDH1=1;LEDH2=0;LEDH3=1;LEDH4=1;  //点亮3航向灯
+			}else if(LED_mun<200)
+			{
+				LEDH1=0;LEDH2=1;LEDH3=1;LEDH4=1;  //点亮4航向灯
+			}else{ LED_mun=0;	}
+		}
+	/*----华丽的分割线----*/
+	}
+}
